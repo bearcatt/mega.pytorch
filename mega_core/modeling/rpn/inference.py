@@ -189,6 +189,7 @@ def make_rpn_postprocessor(config, rpn_box_coder, is_train, version="key"):
     if version == "ref":
         pre_nms_top_n = config.MODEL.VID.RPN.REF_PRE_NMS_TOP_N
         post_nms_top_n = config.MODEL.VID.RPN.REF_POST_NMS_TOP_N
+        fpn_post_nms_top_n = config.MODEL.VID.RPN.REF_POST_NMS_TOP_N
     else:
         pre_nms_top_n = config.MODEL.RPN.PRE_NMS_TOP_N_TRAIN
         post_nms_top_n = config.MODEL.RPN.POST_NMS_TOP_N_TRAIN

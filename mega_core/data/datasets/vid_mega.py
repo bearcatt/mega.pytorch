@@ -1,9 +1,38 @@
-from PIL import Image
+import random
 import sys
 import numpy as np
+from PIL import Image
 
 from .vid import VIDDataset
 from mega_core.config import cfg
+
+
+# modified from torchvision to add support for max size
+def get_size(min_size, max_size, image_size):
+    if not isinstance(min_size, (list, tuple)):
+        min_size = (min_size,)
+
+    w, h = image_size
+    size = random.choice(min_size)
+    max_size = max_size
+    if max_size is not None:
+        min_original_size = float(min((w, h)))
+        max_original_size = float(max((w, h)))
+        if max_original_size / min_original_size * size > max_size:
+            size = int(round(max_size * min_original_size / max_original_size))
+
+    if (w <= h and w == size) or (h <= w and h == size):
+        return (h, w)
+
+    if w < h:
+        ow = size
+        oh = int(size * h / w)
+    else:
+        oh = size
+        ow = int(size * w / h)
+
+    return (oh, ow)
+
 
 class VIDMEGADataset(VIDDataset):
     def __init__(self, image_set, data_dir, img_dir, anno_path, img_index, transforms, is_train=True):
@@ -75,14 +104,20 @@ class VIDMEGADataset(VIDDataset):
         target = self.get_groundtruth(idx)
         target = target.clip_to_image(remove_empty=True)
 
+        if len(cfg.INPUT.MIN_SIZE_TRAIN) > 1:
+            size = get_size(cfg.INPUT.MIN_SIZE_TRAIN, cfg.INPUT.MAX_SIZE_TRAIN, img.size)
+            transform_fn = lambda image, target: self.transforms(image, size, target)
+        else:
+            transform_fn = self.transforms
+
         if self.transforms is not None:
-            img, target = self.transforms(img, target)
+            img, target = transform_fn(img, target)
             for i in range(len(img_refs_l)):
-                img_refs_l[i], _ = self.transforms(img_refs_l[i], None)
+                img_refs_l[i], _ = transform_fn(img_refs_l[i], None)
             for i in range(len(img_refs_m)):
-                img_refs_m[i], _ = self.transforms(img_refs_m[i], None)
+                img_refs_m[i], _ = transform_fn(img_refs_m[i], None)
             for i in range(len(img_refs_g)):
-                img_refs_g[i], _ = self.transforms(img_refs_g[i], None)
+                img_refs_g[i], _ = transform_fn(img_refs_g[i], None)
 
         images = {}
         images["cur"] = img
@@ -122,12 +157,18 @@ class VIDMEGADataset(VIDDataset):
         target = self.get_groundtruth(idx)
         target = target.clip_to_image(remove_empty=True)
 
+        if len(cfg.INPUT.MIN_SIZE_TRAIN) > 1:
+            size = get_size(cfg.INPUT.MIN_SIZE_TRAIN, cfg.INPUT.MAX_SIZE_TRAIN, img.size)
+            transform_fn = lambda image, target: self.transforms(image, size, target)
+        else:
+            transform_fn = self.transforms
+
         if self.transforms is not None:
-            img, target = self.transforms(img, target)
+            img, target = transform_fn(img, target)
             for i in range(len(img_refs_l)):
-                img_refs_l[i], _ = self.transforms(img_refs_l[i], None)
+                img_refs_l[i], _ = transform_fn(img_refs_l[i], None)
             for i in range(len(img_refs_g)):
-                img_refs_g[i], _ = self.transforms(img_refs_g[i], None)
+                img_refs_g[i], _ = transform_fn(img_refs_g[i], None)
 
         images = {}
         images["cur"] = img

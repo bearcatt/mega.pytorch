@@ -82,45 +82,61 @@ class GeneralizedRCNNMEGA(nn.Module):
         proposals_m_list = []
         if imgs_m:
             concat_imgs_m = torch.cat([img.tensors for img in imgs_m], dim=0)
-            concat_feats_m = self.backbone(concat_imgs_m)[0]
-            feats_m_list = torch.chunk(concat_feats_m, len(imgs_m), dim=0)
+            concat_feats_m = self.backbone(concat_imgs_m)
+            # concat_feats_m = concat_feats_m[0]
+            feats_m_list_all_level = []
+            for concat_feats_m_level in concat_feats_m:
+                feats_m_list = torch.chunk(concat_feats_m_level, len(imgs_m), dim=0)
+                feats_m_list_all_level.append(feats_m_list)
+
+            feats_m_list_all_level = list(zip(*feats_m_list_all_level))
 
             for i in range(len(imgs_m)):
-                proposals_ref = self.rpn(imgs_m[i], (feats_m_list[i], ), version="ref")
+                proposals_ref = self.rpn(imgs_m[i], feats_m_list_all_level[i], version="ref")
                 proposals_m_list.append(proposals_ref[0])
         else:
-            feats_m_list = []
+            feats_m_list_all_level = []
 
         # 2. build local frames
         concat_imgs_l = torch.cat([img_cur.tensors, *[img.tensors for img in imgs_l]], dim=0)
-        concat_feats_l = self.backbone(concat_imgs_l)[0]
+        concat_feats_l = self.backbone(concat_imgs_l)
 
         num_imgs = 1 + len(imgs_l)
-        feats_l_list = torch.chunk(concat_feats_l, num_imgs, dim=0)
+        feats_l_list_all_level = []
+        for concat_feats_l_level in concat_feats_l:
+            feats_l_list = torch.chunk(concat_feats_l_level, num_imgs, dim=0)
+            feats_l_list_all_level.append(feats_l_list)
 
-        proposals, proposal_losses = self.rpn(img_cur, (feats_l_list[0],), targets, version="key")
+        feats_l_list_all_level = list(zip(*feats_l_list_all_level))
+
+        proposals, proposal_losses = self.rpn(img_cur, feats_l_list_all_level[0], targets, version="key")
 
         proposals_l_list = []
-        proposals_cur = self.rpn(img_cur, (feats_l_list[0], ), version="ref")
+        proposals_cur = self.rpn(img_cur, feats_l_list_all_level[0], version="ref")
         proposals_l_list.append(proposals_cur[0])
         for i in range(len(imgs_l)):
-            proposals_ref = self.rpn(imgs_l[i], (feats_l_list[i + 1], ), version="ref")
+            proposals_ref = self.rpn(imgs_l[i], feats_l_list_all_level[i + 1], version="ref")
             proposals_l_list.append(proposals_ref[0])
 
         # 3. build global frames
         proposals_g_list = []
         if imgs_g:
             concat_imgs_g = torch.cat([img.tensors for img in imgs_g], dim=0)
-            concat_feats_g = self.backbone(concat_imgs_g)[0]
-            feats_g_list = torch.chunk(concat_feats_g, len(imgs_g), dim=0)
+            concat_feats_g = self.backbone(concat_imgs_g)
+            feats_g_list_all_level = []
+            for concat_feats_g_level in concat_feats_g:
+                feats_g_list = torch.chunk(concat_feats_g_level, len(imgs_g), dim=0)
+                feats_g_list_all_level.append(feats_g_list)
+
+            feats_g_list_all_level = list(zip(*feats_g_list_all_level))
 
             for i in range(len(imgs_g)):
-                proposals_ref = self.rpn(imgs_g[i], (feats_g_list[i], ), version="ref")
+                proposals_ref = self.rpn(imgs_g[i], feats_g_list_all_level[i], version="ref")
                 proposals_g_list.append(proposals_ref[0])
         else:
-            feats_g_list = []
+            feats_g_list_all_level = []
 
-        feats_list = [feats_l_list, feats_m_list, feats_g_list]
+        feats_list = [feats_l_list_all_level, feats_m_list_all_level, feats_g_list_all_level]
         proposals_list = [proposals, proposals_l_list, proposals_m_list, proposals_g_list]
         if self.roi_heads:
             x, result, detector_losses = self.roi_heads(feats_list,

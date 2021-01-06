@@ -699,7 +699,8 @@ class MEGAFeatureExtractor(AttentionExtractor):
         return feats
 
     def generate_feats(self, x, proposals, proposals_key=None, ver="local"):
-        x = self.head(torch.cat(x, dim=0))
+        x = list(zip(*x))
+        x = self.head(torch.cat(x[0], dim=0))
         if self.conv is not None:
             x = F.relu(self.conv(x))
 
@@ -711,6 +712,461 @@ class MEGAFeatureExtractor(AttentionExtractor):
 
         if proposals:
             x = self.pooler((x, ), proposals)
+            x = x.flatten(start_dim=1)
+
+        rois = cat_boxlist(proposals).bbox
+
+        if ver == "local":
+            x_key = F.relu(self.l_fcs[0](x_key))
+        x = F.relu(self.l_fcs[0](x))
+
+        if self.global_cache:
+            if ver == "local":
+                rois_key = proposals_key[0].bbox
+                x_key = self.update_lm(x_key)
+            x = self.update_lm(x)
+
+        # distillation
+        if ver in ("local", "memory"):
+            x_dis = torch.cat([x[:self.advanced_num] for x in torch.split(x, self.base_num, dim=0)], dim=0)
+            rois_dis = torch.cat([x[:self.advanced_num] for x in torch.split(rois, self.base_num, dim=0)], dim=0)
+
+        if ver == "memory":
+            self.memory_cache.append({"rois_cur": rois_dis,
+                                      "rois_ref": rois,
+                                      "feats_cur": x_dis,
+                                      "feats_ref": x})
+            for _ in range(self.stage - 1):
+                self.memory_cache.append({"rois_cur": rois_dis,
+                                          "rois_ref": rois_dis})
+        elif ver == "local":
+            self.local_cache.append({"rois_cur": torch.cat([rois_key, rois_dis], dim=0),
+                                     "rois_ref": rois,
+                                     "feats_cur": torch.cat([x_key, x_dis], dim=0),
+                                     "feats_ref": x})
+            for _ in range(self.stage - 2):
+                self.local_cache.append({"rois_cur": torch.cat([rois_key, rois_dis], dim=0),
+                                         "rois_ref": rois_dis})
+            self.local_cache.append({"rois_cur": rois_key,
+                                     "rois_ref": rois_dis})
+        elif ver == "global":
+            self.global_cache.append({"feats": x})
+
+    def generate_feats_test(self, x, proposals):
+        proposals, proposals_ref, proposals_ref_dis, x_ref, x_ref_dis = proposals
+
+        if self.global_enable and self.global_cache:
+            x = self.update_lm(x)
+            x_ref = self.update_lm(x_ref)
+            x_ref_dis = self.update_lm(x_ref_dis)
+
+        rois_key = proposals[0].bbox
+        rois = proposals_ref.bbox
+        rois_dis = proposals_ref_dis.bbox
+
+        self.local_cache.append({"rois_cur": torch.cat([rois_key, rois_dis], dim=0),
+                                 "rois_ref": rois,
+                                 "feats_cur": torch.cat([x, x_ref_dis], dim=0),
+                                 "feats_ref": x_ref})
+        for _ in range(self.stage - 2):
+            self.local_cache.append({"rois_cur": torch.cat([rois_key, rois_dis], dim=0),
+                                     "rois_ref": rois_dis})
+        self.local_cache.append({"rois_cur": rois_key,
+                                 "rois_ref": rois_dis})
+
+    def _forward_train_single(self, i, cache, memory=None, ver="memory"):
+        rois_cur = cache.pop("rois_cur")
+        rois_ref = cache.pop("rois_ref")
+        feats_cur = cache.pop("feats_cur")
+        feats_ref = cache.pop("feats_ref")
+
+        if memory is not None:
+            rois_ref = torch.cat([rois_ref, memory["rois"]], dim=0)
+            feats_ref = torch.cat([feats_ref, memory["feats"]], dim=0)
+
+        if ver == "memory":
+            self.mem.append({"rois": rois_ref, "feats": feats_ref})
+            if i == self.stage - 1:
+                return
+
+        if rois_cur is not None:
+            position_embedding = self.cal_position_embedding(rois_cur, rois_ref)
+        else:
+            position_embedding = None
+
+        attention = self.attention_module_multi_head(feats_cur, feats_ref, position_embedding,
+                                                     feat_dim=1024, group=16, dim=(1024, 1024, 1024),
+                                                     index=i, ver=ver)
+        feats_cur = feats_cur + attention
+
+        if i != self.stage - 1:
+            feats_cur = F.relu(self.l_fcs[i + 1](feats_cur))
+
+        return feats_cur
+
+    def _forward_test_single(self, i, cache, memory):
+        rois_cur = cache.pop("rois_cur")
+        rois_ref = cache.pop("rois_ref")
+        feats_cur = cache.pop("feats_cur")
+        feats_ref = cache.pop("feats_ref")
+
+        if memory is not None:
+            rois_ref = torch.cat([rois_ref, memory["rois"]], dim=0)
+            feats_ref = torch.cat([feats_ref, memory["feats"]], dim=0)
+
+        if rois_cur is not None:
+            position_embedding = self.cal_position_embedding(rois_cur, rois_ref)
+        else:
+            position_embedding = None
+
+        attention = self.attention_module_multi_head(feats_cur, feats_ref, position_embedding,
+                                                     feat_dim=1024, group=16, dim=(1024, 1024, 1024),
+                                                     index=i)
+        feats_cur = feats_cur + attention
+
+        if i != self.stage - 1:
+            feats_cur = F.relu(self.l_fcs[i + 1](feats_cur))
+
+        return feats_cur
+
+    def _forward_train(self, x, proposals):
+        proposals, proposals_l, proposals_m, proposals_g = proposals
+        x_l, x_m, x_g = x
+
+        self.global_cache = []
+        self.memory_cache = []
+        self.local_cache = []
+        if proposals_g:
+            self.generate_feats(x_g, proposals_g, ver="global")
+
+        if proposals_m:
+            with torch.no_grad():
+                self.generate_feats(x_m, proposals_m, ver="memory")
+
+        self.generate_feats(x_l, proposals_l, proposals, ver="local")
+
+        # 1. generate long range memory
+        with torch.no_grad():
+            if self.memory_cache:
+                self.mem = []
+                for i in range(self.stage):
+                    feats = self._forward_train_single(i, self.memory_cache[i], None, ver="memory")
+
+                    if i == self.stage - 1:
+                        break
+
+                    self.memory_cache[i + 1]["feats_cur"] = feats
+                    self.memory_cache[i + 1]["feats_ref"] = feats
+            else:
+                self.mem = None
+
+        # 2. update current feats
+        for i in range(self.stage):
+            if self.mem is not None:
+                memory = self.mem[i]
+            else:
+                memory = None
+
+            feats = self._forward_train_single(i, self.local_cache[i], memory, ver="local")
+
+            if i == self.stage - 1:
+                x = feats
+            elif i == self.stage - 2:
+                self.local_cache[i + 1]["feats_cur"] = feats[:len(proposals[0])]
+                self.local_cache[i + 1]["feats_ref"] = feats[len(proposals[0]):]
+            else:
+                self.local_cache[i + 1]["feats_cur"] = feats
+                self.local_cache[i + 1]["feats_ref"] = feats[len(proposals[0]):]
+
+        for i in range(self.global_res_stage):
+            x = self.update_lm(x, i + 1)
+
+        return x
+
+    def _forward_ref(self, x, proposals):
+        if self.conv is not None:
+            x = self.head(x)
+            x = (F.relu(self.conv(x)), )
+        else:
+            x = (self.head(x), )
+        x = self.pooler(x, proposals)
+        x = x.flatten(start_dim=1)
+
+        x = F.relu(self.l_fcs[0](x))
+
+        return x
+
+    def _forward_test(self, x, proposals):
+        # proposals, proposals_ref, x_refs = proposals
+        if self.conv is not None:
+            x = self.head(x)
+            x = (F.relu(self.conv(x)), )
+        else:
+            x = (self.head(x), )
+        x = self.pooler(x, proposals[0])
+        x = x.flatten(start_dim=1)
+        x = F.relu(self.l_fcs[0](x))
+
+        self.local_cache = []
+
+        self.generate_feats_test(x, proposals)
+
+        for i in range(self.stage):
+            memory = self.mem[i] if self.mem[i] else None
+
+            if self.memory_enable:
+                self.update_memory(i, self.local_cache[i])
+
+            feat_cur = self._forward_test_single(i, self.local_cache[i], memory)
+
+            if i == self.stage - 1:
+                x = feat_cur
+            elif i == self.stage - 2:
+                self.local_cache[i + 1]["feats_cur"] = feat_cur[:len(proposals[0][0])]
+                self.local_cache[i + 1]["feats_ref"] = feat_cur[len(proposals[0][0]):]
+            else:
+                self.local_cache[i + 1]["feats_cur"] = feat_cur
+                self.local_cache[i + 1]["feats_ref"] = feat_cur[len(proposals[0][0]):]
+
+        for i in range(self.global_res_stage):
+            x = self.update_lm(x, i + 1)
+
+        return x
+
+
+@registry.ROI_BOX_FEATURE_EXTRACTORS.register("MEGAFPNFeatureExtractor")
+class MEGAFPNFeatureExtractor(AttentionExtractor):
+    def __init__(self, cfg, in_channels):
+        super(MEGAFPNFeatureExtractor, self).__init__(cfg, in_channels)
+
+        resolution = cfg.MODEL.ROI_BOX_HEAD.POOLER_RESOLUTION
+        scales = cfg.MODEL.ROI_BOX_HEAD.POOLER_SCALES
+        sampling_ratio = cfg.MODEL.ROI_BOX_HEAD.POOLER_SAMPLING_RATIO
+        pooler = Pooler(
+            output_size=(resolution, resolution),
+            scales=scales,
+            sampling_ratio=sampling_ratio,
+        )
+        self.pooler = pooler
+
+        input_size = in_channels * resolution ** 2
+        representation_size = cfg.MODEL.ROI_BOX_HEAD.MLP_HEAD_DIM
+        use_gn = cfg.MODEL.ROI_BOX_HEAD.USE_GN
+
+        self.all_frame_interval = cfg.MODEL.VID.MEGA.ALL_FRAME_INTERVAL
+
+        if cfg.MODEL.VID.ROI_BOX_HEAD.ATTENTION.ENABLE:
+            self.embed_dim = cfg.MODEL.VID.ROI_BOX_HEAD.ATTENTION.EMBED_DIM
+            self.groups = cfg.MODEL.VID.ROI_BOX_HEAD.ATTENTION.GROUP
+            self.feat_dim = representation_size
+
+            self.stage = cfg.MODEL.VID.ROI_BOX_HEAD.ATTENTION.STAGE
+
+            self.base_num = cfg.MODEL.VID.RPN.REF_POST_NMS_TOP_N
+            self.advanced_num = int(self.base_num * cfg.MODEL.VID.MEGA.RATIO)
+
+            fcs, Wgs, Wqs, Wks, Wvs, us = [], [], [], [], [], []
+
+            for i in range(self.stage):
+                r_size = input_size if i == 0 else representation_size
+                fcs.append(make_fc(r_size, representation_size, use_gn))
+                Wgs.append(Conv2d(self.embed_dim, self.groups, kernel_size=1, stride=1, padding=0))
+                Wqs.append(make_fc(self.feat_dim, self.feat_dim))
+                Wks.append(make_fc(self.feat_dim, self.feat_dim))
+                Wvs.append(Conv2d(self.feat_dim * self.groups, self.feat_dim, kernel_size=1, stride=1, padding=0, groups=self.groups))
+                us.append(nn.Parameter(torch.Tensor(self.groups, 1, self.embed_dim)))
+                for l in [Wgs[i], Wvs[i]]:
+                    torch.nn.init.normal_(l.weight, std=0.01)
+                    torch.nn.init.constant_(l.bias, 0)
+                for weight in [us[i]]:
+                    torch.nn.init.normal_(weight, std=0.01)
+
+            self.l_fcs = nn.ModuleList(fcs)
+            self.l_Wgs = nn.ModuleList(Wgs)
+            self.l_Wqs = nn.ModuleList(Wqs)
+            self.l_Wks = nn.ModuleList(Wks)
+            self.l_Wvs = nn.ModuleList(Wvs)
+            self.l_us = nn.ParameterList(us)
+
+        # Long Range Memory
+        self.memory_enable = cfg.MODEL.VID.MEGA.MEMORY.ENABLE
+        if self.memory_enable:
+            self.memory_size = cfg.MODEL.VID.MEGA.MEMORY.SIZE
+
+        # Global Aggregation Stage
+        self.global_enable = cfg.MODEL.VID.MEGA.GLOBAL.ENABLE
+        if self.global_enable:
+            self.global_size = cfg.MODEL.VID.MEGA.GLOBAL.SIZE
+            self.global_res_stage = cfg.MODEL.VID.MEGA.GLOBAL.RES_STAGE
+
+            Wqs, Wks, Wvs, us = [], [], [], []
+
+            for i in range(self.global_res_stage + 1):
+                Wqs.append(make_fc(self.feat_dim, self.feat_dim))
+                Wks.append(make_fc(self.feat_dim, self.feat_dim))
+                Wvs.append(Conv2d(self.feat_dim * self.groups, self.feat_dim, kernel_size=1, stride=1, padding=0, groups=self.groups))
+                us.append(nn.Parameter(torch.Tensor(self.groups, 1, self.embed_dim)))
+                for l in [Wvs[i]]:
+                    torch.nn.init.normal_(l.weight, std=0.01)
+                    torch.nn.init.constant_(l.bias, 0)
+                for weight in [us[i]]:
+                    torch.nn.init.normal_(weight, std=0.01)
+
+            self.g_Wqs = nn.ModuleList(Wqs)
+            self.g_Wks = nn.ModuleList(Wks)
+            self.g_Wvs = nn.ModuleList(Wvs)
+            self.g_us = nn.ParameterList(us)
+
+        self.out_channels = representation_size
+
+    def attention_module_multi_head(self, roi_feat, ref_feat, position_embedding,
+                                    feat_dim=1024, dim=(1024, 1024, 1024), group=16,
+                                    index=0, ver="local"):
+        """
+
+        :param roi_feat: [num_rois, feat_dim]
+        :param position_embedding: [1, emb_dim, num_rois, num_nongt_rois]
+        :param relative_pe: [1, demb_dim, num_rois, num_nongt_rois]
+        :param non_gt_index:
+        :param fc_dim: same as group
+        :param feat_dim: should be same as dim[2]
+        :param dim: a 3-tuple of (query, key, output)
+        :param group:
+        :return:
+        """
+        if ver in ("local", "memory"):
+            Wgs, Wqs, Wks, Wvs, us = self.l_Wgs, self.l_Wqs, self.l_Wks, self.l_Wvs, self.l_us
+        else:
+            assert position_embedding is None
+            Wqs, Wks, Wvs, us = self.g_Wqs, self.g_Wks, self.g_Wvs, self.g_us
+
+        dim_group = (dim[0] / group, dim[1] / group, dim[2] / group)
+
+        # position_embedding, [1, emb_dim, num_rois, num_nongt_rois]
+        # -> position_feat_1, [1, group, num_rois, nongt_dim]
+        if position_embedding is not None:
+            position_feat_1 = F.relu(Wgs[index](position_embedding))
+            # aff_weight, [num_rois, group, num_nongt_rois, 1]
+            aff_weight = position_feat_1.permute(2, 1, 3, 0)
+            # aff_weight, [num_rois, group, num_nongt_rois]
+            aff_weight = aff_weight.squeeze(3)
+
+        # multi head
+        assert dim[0] == dim[1]
+
+        q_data = Wqs[index](roi_feat)
+        q_data_batch = q_data.reshape(-1, group, int(dim_group[0]))
+        # q_data_batch, [group, num_rois, dim_group[0]]
+        q_data_batch = q_data_batch.permute(1, 0, 2)
+
+        k_data = Wks[index](ref_feat)
+        k_data_batch = k_data.reshape(-1, group, int(dim_group[1]))
+        # k_data_batch, [group, num_nongt_rois, dim_group[1]]
+        k_data_batch = k_data_batch.permute(1, 0, 2)
+
+        # v_data, [num_nongt_rois, feat_dim]
+        v_data = ref_feat
+
+        # aff_a, [group, num_rois, num_nongt_rois]
+        aff_a = torch.bmm(q_data_batch, k_data_batch.transpose(1, 2))
+
+        # aff_c, [group, 1, num_nongt_rois]
+        aff_c = torch.bmm(us[index], k_data_batch.transpose(1, 2))
+
+        # aff = aff_a + aff_b + aff_c + aff_d
+        aff = aff_a + aff_c
+
+        aff_scale = (1.0 / math.sqrt(float(dim_group[1]))) * aff
+        # aff_scale, [num_rois, group, num_nongt_rois]
+        aff_scale = aff_scale.permute(1, 0, 2)
+
+        # weighted_aff, [num_rois, group, num_nongt_rois]
+        if position_embedding is not None:
+            weighted_aff = (aff_weight + 1e-6).log() + aff_scale
+        else:
+            weighted_aff = aff_scale
+        aff_softmax = F.softmax(weighted_aff, dim=2)
+
+        aff_softmax_reshape = aff_softmax.reshape(aff_softmax.shape[0] * aff_softmax.shape[1], aff_softmax.shape[2])
+
+        # output_t, [num_rois * group, feat_dim]
+        output_t = torch.matmul(aff_softmax_reshape, v_data)
+        # output_t, [num_rois, group * feat_dim, 1, 1]
+        output_t = output_t.reshape(-1, group * feat_dim, 1, 1)
+        # linear_out, [num_rois, dim[2], 1, 1]
+        linear_out = Wvs[index](output_t)
+
+        output = linear_out.squeeze(3).squeeze(2)
+
+        return output
+
+    def forward(self, x, proposals, pre_calculate=False):
+        if pre_calculate:
+            return self._forward_ref(x, proposals)
+
+        if self.training:
+            return self._forward_train(x, proposals)
+        else:
+            return self._forward_test(x, proposals)
+
+    def init_memory(self):
+        self.mem_queue_list = []
+        self.mem = []
+        for i in range(self.stage):
+            queue = {"rois": deque(maxlen=self.all_frame_interval),
+                     "feats": deque(maxlen=self.all_frame_interval)}
+            self.mem_queue_list.append(queue)
+            self.mem.append(dict())
+
+    def init_global(self):
+        self.global_queue_list = []
+        self.global_cache = []
+
+        queue = {"feats": deque(maxlen=self.global_size)}
+        self.global_queue_list.append(queue)
+        self.global_cache.append(dict())
+
+    def update_global(self, feats):
+        self.global_queue_list[0]["feats"].append(feats)
+        self.global_cache[0]["feats"] = torch.cat(list(self.global_queue_list[0]["feats"]), dim=0)
+
+    def update_memory(self, i, cache):
+        number_to_push = self.base_num if i == 0 else self.advanced_num
+
+        rois = cache["rois_ref"][:number_to_push]
+        feats = cache["feats_ref"][:number_to_push]
+
+        self.mem_queue_list[i]["rois"].append(rois)
+        self.mem_queue_list[i]["feats"].append(feats)
+
+        self.mem[i] = {"rois": torch.cat(list(self.mem_queue_list[i]["rois"]), dim=0),
+                       "feats": torch.cat(list(self.mem_queue_list[i]["feats"]), dim=0)}
+
+    def update_lm(self, feats, i=0):
+        feats_ref = self.global_cache[-1]["feats"]
+
+        attention = self.attention_module_multi_head(feats, feats_ref, None,
+                                                     feat_dim=1024, group=16, dim=(1024, 1024, 1024),
+                                                     index=i, ver="global")
+
+        feats = feats + attention
+
+        return feats
+
+    def generate_feats(self, x, proposals, proposals_key=None, ver="local"):
+        x = list(zip(*x))
+        x_all_level = []
+        for x_level in x:
+            x_level = torch.cat(x_level, dim=0)
+            x_all_level.append(x_level)
+
+        if proposals_key is not None:
+            assert ver == "local"
+            x_key = self.pooler([x_level[0:1, ...] for x_level in x_all_level], proposals_key)
+            x_key = x_key.flatten(start_dim=1)
+
+        if proposals:
+            x = self.pooler(x_all_level, proposals)
             x = x.flatten(start_dim=1)
 
         rois = cat_boxlist(proposals).bbox

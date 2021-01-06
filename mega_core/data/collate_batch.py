@@ -24,9 +24,7 @@ class BatchCollator(object):
             for key in transposed_batch[0][0].keys():
                 if key == "cur":
                     images["cur"] = to_image_list((transposed_batch[0][0]["cur"], ), self.size_divisible)
-                if key not in ("ref", "ref_l", "ref_m", "ref_g"):
-                    images[key] = transposed_batch[0][0][key]
-                else:
+                elif key in ("ref_l", "ref_m", "ref_g"):
                     if transposed_batch[0][0][key]:
                         images[key] = [to_image_list((img,), self.size_divisible) for img in transposed_batch[0][0][key]]
                     else:
