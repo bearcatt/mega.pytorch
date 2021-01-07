@@ -29,6 +29,8 @@ class BatchCollator(object):
                         images[key] = [to_image_list((img,), self.size_divisible) for img in transposed_batch[0][0][key]]
                     else:
                         images[key] = []
+                else:
+                    images[key] = transposed_batch[0][0][key]
         else:
             raise NotImplementedError("method {} not supported yet.".format(self.method))
 

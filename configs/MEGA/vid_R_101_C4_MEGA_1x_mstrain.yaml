@@ -17,5 +17,3 @@ INPUT:
 DATASETS:
   TRAIN: ("DET_train_30classes", "VID_train_15frames")
   TEST: ("VID_val_videos",)
-SOLVER:
-  TEST_PERIOD: 2500
