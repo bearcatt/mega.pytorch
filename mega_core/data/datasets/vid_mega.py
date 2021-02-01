@@ -157,11 +157,7 @@ class VIDMEGADataset(VIDDataset):
         target = self.get_groundtruth(idx)
         target = target.clip_to_image(remove_empty=True)
 
-        if len(cfg.INPUT.MIN_SIZE_TRAIN) > 1:
-            size = get_size(cfg.INPUT.MIN_SIZE_TRAIN, cfg.INPUT.MAX_SIZE_TRAIN, img.size)
-            transform_fn = lambda image, target: self.transforms(image, size, target)
-        else:
-            transform_fn = self.transforms
+        transform_fn = self.transforms
 
         if self.transforms is not None:
             img, target = transform_fn(img, target)
