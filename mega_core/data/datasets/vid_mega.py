@@ -94,7 +94,7 @@ class VIDMEGADataset(VIDDataset):
 
     def _get_test(self, idx):
         filename = self.image_set_index[idx]
-        img = Image.open(self._img_dir % filename).convert("RGB")
+        img_cur = Image.open(self._img_dir % filename).convert("RGB")
 
         # give the current frame a category. 0 for start, 1 for normal
         frame_id = int(filename.split("/")[-1])
@@ -116,21 +116,21 @@ class VIDMEGADataset(VIDDataset):
             for id in range(size):
                 filename = self.pattern[idx] % shuffled_index[
                     (idx - self.start_id[idx] + cfg.MODEL.VID.MEGA.GLOBAL.SIZE - id - 1) % self.frame_seg_len[idx]]
-                img = Image.open(self._img_dir % filename).convert("RGB")
-                img_refs_g.append(img)
+                img_ref = Image.open(self._img_dir % filename).convert("RGB")
+                img_refs_g.append(img_ref)
 
         target = self.get_groundtruth(idx)
         target = target.clip_to_image(remove_empty=True)
 
         if self.transforms is not None:
-            img, target = self.transforms(img, target)
+            img_cur, target = self.transforms(img_cur, target)
             for i in range(len(img_refs_l)):
                 img_refs_l[i], _ = self.transforms(img_refs_l[i], None)
             for i in range(len(img_refs_g)):
                 img_refs_g[i], _ = self.transforms(img_refs_g[i], None)
 
         images = {}
-        images["cur"] = img
+        images["cur"] = img_cur
         images["ref_l"] = img_refs_l
         images["ref_g"] = img_refs_g
         images["frame_category"] = frame_category
