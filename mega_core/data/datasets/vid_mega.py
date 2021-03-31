@@ -157,18 +157,12 @@ class VIDMEGADataset(VIDDataset):
         target = self.get_groundtruth(idx)
         target = target.clip_to_image(remove_empty=True)
 
-        if len(cfg.INPUT.MIN_SIZE_TRAIN) > 1:
-            size = get_size(cfg.INPUT.MIN_SIZE_TRAIN, cfg.INPUT.MAX_SIZE_TRAIN, img.size)
-            transform_fn = lambda image, target: self.transforms(image, size, target)
-        else:
-            transform_fn = self.transforms
-
         if self.transforms is not None:
-            img_cur, target = transform_fn(img_cur, target)
+            img_cur, target = self.transforms(img_cur, target)
             for i in range(len(img_refs_l)):
-                img_refs_l[i], _ = transform_fn(img_refs_l[i], None)
+                img_refs_l[i], _ = self.transforms(img_refs_l[i], None)
             for i in range(len(img_refs_g)):
-                img_refs_g[i], _ = transform_fn(img_refs_g[i], None)
+                img_refs_g[i], _ = self.transforms(img_refs_g[i], None)
 
         images = {}
         images["cur"] = img_cur

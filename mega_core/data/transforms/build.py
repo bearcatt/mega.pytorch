@@ -6,7 +6,7 @@ from . import build_video_transform as VT
 
 
 def build_transforms(cfg, is_train=True):
-    if len(cfg.INPUT.MIN_SIZE_TRAIN) > 1:
+    if is_train and len(cfg.INPUT.MIN_SIZE_TRAIN) > 1:
         transform = VT.build_transforms(cfg, is_train)
     else:
         transform = IT.build_transforms(cfg, is_train)
